@@ -1,10 +1,12 @@
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import type { Context } from "telegraf";
-import { SERVICES, getServiceById } from "./services";
-import { DialogState, resetState, getState, setState } from "./dialogFlow";
+import { SERVICES, getServiceById, getServiceName } from "./services";
+import { resetState, getState, setState } from "./dialogFlow";
 import { getNextWorkingDays } from "./dateUtils";
 import { getFreeSlots, createBooking, SlotTakenError } from "./db/bookings";
+import { Lang, LANGUAGES, isLang, t } from "./i18n";
+import { getLang, setLang } from "./langStore";
 import "./db";
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -14,68 +16,111 @@ if (!BOT_TOKEN) {
 
 export const bot = new Telegraf(BOT_TOKEN);
 
-const BACK_BUTTON = Markup.button.callback("🔙 Back", "back");
+function backButton(lang: Lang) {
+  return Markup.button.callback(t(lang, "back"), "back");
+}
 
-function serviceKeyboard() {
+function serviceKeyboard(lang: Lang) {
   const buttons = SERVICES.map((s) =>
-    Markup.button.callback(`${s.name} — €${s.price} (${s.durationMinutes} min)`, `service:${s.id}`)
+    Markup.button.callback(
+      `${getServiceName(s, lang)} — €${s.price} (${s.durationMinutes} min)`,
+      `service:${s.id}`
+    )
   );
-  return Markup.inlineKeyboard(buttons, { columns: 1 });
+  const languageRow = [Markup.button.callback(t(lang, "changeLanguage"), "language")];
+  return Markup.inlineKeyboard([...buttons.map((b) => [b]), languageRow]);
 }
 
-function dateKeyboard() {
-  const days = getNextWorkingDays(5);
+function dateKeyboard(lang: Lang) {
+  const days = getNextWorkingDays(5, lang);
   const buttons = days.map((d) => Markup.button.callback(d.label, `date:${d.iso}`));
-  return Markup.inlineKeyboard([...buttons.map((b) => [b]), [BACK_BUTTON]]);
+  return Markup.inlineKeyboard([...buttons.map((b) => [b]), [backButton(lang)]]);
 }
 
-function timeKeyboard(date: string) {
+function timeKeyboard(date: string, lang: Lang) {
   const freeSlots = getFreeSlots(date);
   const buttons = freeSlots.map((slot) => Markup.button.callback(slot, `time:${slot}`));
   const rows: ReturnType<typeof Markup.button.callback>[][] = [];
   for (let i = 0; i < buttons.length; i += 4) {
     rows.push(buttons.slice(i, i + 4));
   }
-  rows.push([BACK_BUTTON]);
+  rows.push([backButton(lang)]);
   return { keyboard: Markup.inlineKeyboard(rows), freeSlots };
 }
 
-function confirmKeyboard() {
+function confirmKeyboard(lang: Lang) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("✅ Confirm", "confirm:yes")],
-    [Markup.button.callback("❌ Cancel", "confirm:no")],
+    [Markup.button.callback(t(lang, "confirmYes"), "confirm:yes")],
+    [Markup.button.callback(t(lang, "confirmNo"), "confirm:no")],
   ]);
 }
 
-async function renderServiceStep(ctx: Context) {
-  await ctx.editMessageText("Choose a service:", serviceKeyboard());
+function languageKeyboard() {
+  return Markup.inlineKeyboard(
+    LANGUAGES.map((l) => [Markup.button.callback(l.label, `lang:${l.code}`)])
+  );
 }
 
-async function renderDateStep(ctx: Context) {
-  await ctx.editMessageText("Choose a convenient day:", dateKeyboard());
+async function renderServiceStep(ctx: Context, lang: Lang) {
+  await ctx.editMessageText(t(lang, "chooseService"), serviceKeyboard(lang));
 }
 
-async function renderTimeStep(ctx: Context, date: string, note?: string) {
-  const { keyboard, freeSlots } = timeKeyboard(date);
-  const text = note ? `${note}\n\nChoose a time:` : "Choose a time:";
+async function renderDateStep(ctx: Context, lang: Lang) {
+  await ctx.editMessageText(t(lang, "chooseDay"), dateKeyboard(lang));
+}
+
+async function renderTimeStep(ctx: Context, date: string, lang: Lang, note?: string) {
+  const { keyboard, freeSlots } = timeKeyboard(date, lang);
   if (freeSlots.length === 0) {
     await ctx.editMessageText(
-      `${note ? note + "\n\n" : ""}No free slots left for this day. Please choose another day.`,
-      dateKeyboard()
+      `${note ? note + "\n\n" : ""}${t(lang, "noSlotsLeft")}`,
+      dateKeyboard(lang)
     );
     return;
   }
+  const text = note ? `${note}\n\n${t(lang, "chooseTime")}` : t(lang, "chooseTime");
   await ctx.editMessageText(text, keyboard);
 }
 
 bot.start(async (ctx) => {
+  const lang = getLang(ctx.chat.id);
   resetState(ctx.chat.id);
-  await ctx.reply("Welcome to the barbershop! Choose a service:", serviceKeyboard());
+  await ctx.reply(t(lang, "welcome"), serviceKeyboard(lang));
+});
+
+bot.command("language", async (ctx) => {
+  const lang = getLang(ctx.chat.id);
+  await ctx.reply(t(lang, "chooseLanguage"), languageKeyboard());
+});
+
+bot.action("language", async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  const lang = getLang(chatId);
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(t(lang, "chooseLanguage"), languageKeyboard());
+});
+
+bot.action(/^lang:(.+)$/, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+
+  const code = ctx.match[1];
+  if (!isLang(code)) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  setLang(chatId, code);
+  resetState(chatId);
+  await ctx.answerCbQuery(t(code, "languageSet"));
+  await ctx.editMessageText(t(code, "welcome"), serviceKeyboard(code));
 });
 
 bot.action(/^service:(.+)$/, async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
+  const lang = getLang(chatId);
 
   const state = getState(chatId);
   if (!state || state.step !== "service") {
@@ -85,18 +130,19 @@ bot.action(/^service:(.+)$/, async (ctx) => {
 
   const service = getServiceById(ctx.match[1]);
   if (!service) {
-    await ctx.answerCbQuery("Service not found");
+    await ctx.answerCbQuery(t(lang, "serviceNotFound"));
     return;
   }
 
   setState(chatId, { step: "date", service });
   await ctx.answerCbQuery();
-  await renderDateStep(ctx);
+  await renderDateStep(ctx, lang);
 });
 
 bot.action(/^date:(.+)$/, async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
+  const lang = getLang(chatId);
 
   const state = getState(chatId);
   if (!state || state.step !== "date" || !state.service) {
@@ -105,20 +151,21 @@ bot.action(/^date:(.+)$/, async (ctx) => {
   }
 
   const iso = ctx.match[1];
-  const day = getNextWorkingDays(5).find((d) => d.iso === iso);
+  const day = getNextWorkingDays(5, lang).find((d) => d.iso === iso);
   if (!day) {
-    await ctx.answerCbQuery("This date is no longer available");
+    await ctx.answerCbQuery(t(lang, "dateUnavailable"));
     return;
   }
 
   setState(chatId, { ...state, step: "time", date: day.iso, dateLabel: day.label });
   await ctx.answerCbQuery();
-  await renderTimeStep(ctx, day.iso);
+  await renderTimeStep(ctx, day.iso, lang);
 });
 
 bot.action(/^time:(.+)$/, async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
+  const lang = getLang(chatId);
 
   const state = getState(chatId);
   if (!state || state.step !== "time" || !state.service || !state.date) {
@@ -129,22 +176,23 @@ bot.action(/^time:(.+)$/, async (ctx) => {
   const time = ctx.match[1];
   const freeSlots = getFreeSlots(state.date);
   if (!freeSlots.includes(time)) {
-    await ctx.answerCbQuery("This time is already booked");
-    await renderTimeStep(ctx, state.date, "This time slot was just taken.");
+    await ctx.answerCbQuery(t(lang, "timeTaken"));
+    await renderTimeStep(ctx, state.date, lang, t(lang, "timeTakenNote"));
     return;
   }
 
   setState(chatId, { ...state, step: "name", time });
   await ctx.answerCbQuery();
   await ctx.editMessageText(
-    `Service: ${state.service.name}\nDay: ${state.dateLabel}\nTime: ${time}\n\nPlease type your name:`,
-    Markup.inlineKeyboard([[BACK_BUTTON]])
+    t(lang, "askName", { service: getServiceName(state.service, lang), day: state.dateLabel ?? "", time }),
+    Markup.inlineKeyboard([[backButton(lang)]])
   );
 });
 
 bot.action("back", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
+  const lang = getLang(chatId);
 
   const state = getState(chatId);
   if (!state) {
@@ -157,11 +205,11 @@ bot.action("back", async (ctx) => {
   switch (state.step) {
     case "date":
       setState(chatId, { step: "service" });
-      await renderServiceStep(ctx);
+      await renderServiceStep(ctx, lang);
       break;
     case "time":
       setState(chatId, { step: "date", service: state.service });
-      await renderDateStep(ctx);
+      await renderDateStep(ctx, lang);
       break;
     case "name":
       setState(chatId, {
@@ -171,7 +219,7 @@ bot.action("back", async (ctx) => {
         dateLabel: state.dateLabel,
       });
       if (state.date) {
-        await renderTimeStep(ctx, state.date);
+        await renderTimeStep(ctx, state.date, lang);
       }
       break;
     default:
@@ -182,6 +230,7 @@ bot.action("back", async (ctx) => {
 
 bot.on("text", async (ctx) => {
   const chatId = ctx.chat.id;
+  const lang = getLang(chatId);
   const state = getState(chatId);
   if (!state || state.step !== "name" || !state.service || !state.date || !state.time) {
     return;
@@ -189,7 +238,7 @@ bot.on("text", async (ctx) => {
 
   const clientName = ctx.message.text.trim();
   if (!clientName) {
-    await ctx.reply("Name cannot be empty. Please type your name:");
+    await ctx.reply(t(lang, "nameEmpty"));
     return;
   }
 
@@ -201,20 +250,21 @@ bot.on("text", async (ctx) => {
   });
 
   await ctx.reply(
-    `Please check the details:\n\n` +
-      `Service: ${state.service.name}\n` +
-      `Day: ${state.dateLabel}\n` +
-      `Time: ${state.time}\n` +
-      `Name: ${clientName}\n` +
-      `Price: €${state.service.price}\n\n` +
-      `Is everything correct?`,
-    confirmKeyboard()
+    t(lang, "confirmSummary", {
+      service: getServiceName(state.service, lang),
+      day: state.dateLabel ?? "",
+      time: state.time,
+      name: clientName,
+      price: state.service.price,
+    }),
+    confirmKeyboard(lang)
   );
 });
 
 bot.action("confirm:yes", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
+  const lang = getLang(chatId);
 
   const state = getState(chatId);
   if (
@@ -231,7 +281,7 @@ bot.action("confirm:yes", async (ctx) => {
 
   try {
     createBooking({
-      serviceName: state.service.name,
+      serviceName: getServiceName(state.service, lang),
       price: state.service.price,
       date: state.date,
       time: state.time,
@@ -240,23 +290,23 @@ bot.action("confirm:yes", async (ctx) => {
     });
   } catch (err) {
     if (err instanceof SlotTakenError) {
-      await ctx.answerCbQuery("This time slot was just taken");
+      await ctx.answerCbQuery(t(lang, "slotTakenToast"));
       setState(chatId, { step: "time", service: state.service, date: state.date, dateLabel: state.dateLabel });
-      await renderTimeStep(ctx, state.date, "This time slot was just taken, please choose another.");
+      await renderTimeStep(ctx, state.date, lang, t(lang, "slotTakenNote"));
       return;
     }
     throw err;
   }
 
-  await ctx.answerCbQuery("Booking confirmed!");
+  await ctx.answerCbQuery(t(lang, "bookingConfirmedToast"));
   await ctx.editMessageText(
-    `✅ Booking confirmed!\n\n` +
-      `Service: ${state.service.name}\n` +
-      `Day: ${state.dateLabel}\n` +
-      `Time: ${state.time}\n` +
-      `Name: ${state.clientName}\n` +
-      `Price: €${state.service.price}\n\n` +
-      `We look forward to seeing you! To book again, send /start`
+    t(lang, "bookingConfirmedMessage", {
+      service: getServiceName(state.service, lang),
+      day: state.dateLabel ?? "",
+      time: state.time,
+      name: state.clientName,
+      price: state.service.price,
+    })
   );
   resetState(chatId);
 });
@@ -264,6 +314,7 @@ bot.action("confirm:yes", async (ctx) => {
 bot.action("confirm:no", async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
+  const lang = getLang(chatId);
 
   const state = getState(chatId);
   if (!state || state.step !== "confirm") {
@@ -271,9 +322,9 @@ bot.action("confirm:no", async (ctx) => {
     return;
   }
 
-  await ctx.answerCbQuery("Booking cancelled");
+  await ctx.answerCbQuery(t(lang, "bookingCancelledToast"));
   resetState(chatId);
-  await ctx.editMessageText("Booking cancelled. Choose a service:", serviceKeyboard());
+  await ctx.editMessageText(t(lang, "bookingCancelledMessage"), serviceKeyboard(lang));
 });
 
 bot.launch(() => {

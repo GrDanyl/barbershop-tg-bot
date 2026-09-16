@@ -2,6 +2,8 @@
 
 A Telegram bot for booking a barbershop appointment via inline buttons: service → day → time → name → confirmation.
 
+Supports English, German and Russian — switch anytime with `/language` or the "🌐 Language" button.
+
 ## Run locally
 
 1. Install dependencies:
@@ -67,8 +69,10 @@ docker compose down
 
 - `src/bot.ts` — Telegraf setup, all dialog step handlers
 - `src/dialogFlow.ts` — in-memory dialog state machine, keyed by chat_id
-- `src/dateUtils.ts` — generates the next working days (Mon-Sat)
-- `src/services.ts` — list of barbershop services (edit directly)
+- `src/langStore.ts` — in-memory language preference per chat_id
+- `src/i18n.ts` — translated strings (English, German, Russian)
+- `src/dateUtils.ts` — generates the next working days (Mon-Sat), labeled per language
+- `src/services.ts` — list of barbershop services with translated names (edit directly)
 - `src/db/index.ts` — SQLite connection, `bookings` table schema
 - `src/db/bookings.ts` — queries: free slots, create booking (with race-condition protection)
 
@@ -89,6 +93,10 @@ Just edit the `SERVICES` array in [src/services.ts](src/services.ts).
 ## Editing the time slots
 
 The `TIME_SLOTS` array in [src/db/bookings.ts](src/db/bookings.ts).
+
+## Adding a new language
+
+Add the language code to `Lang` in [src/i18n.ts](src/i18n.ts), add an entry to `LANGUAGES` and `MESSAGES`, then add translated names in `src/services.ts` and weekday/month arrays in `src/dateUtils.ts`.
 
 ## Security note
 
